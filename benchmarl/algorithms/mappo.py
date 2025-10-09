@@ -245,6 +245,10 @@ class Mappo(Algorithm):
         minibatches = []
         while last_start_index < batch.shape[0]:
             minimbatch = batch[last_start_index:start_index]
+            # Ensure all tensors are on the same device
+            # Fix for RuntimeError: Expected all tensors to be on the same device, but found at least two devices, mps:0 and cpu!
+            if minimbatch.device != self.device:
+                minimbatch = minimbatch.to(self.device)
             minibatches.append(minimbatch)
             with torch.no_grad():
                 loss.value_estimator(

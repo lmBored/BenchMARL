@@ -257,10 +257,26 @@ class Cnn(Model):
             )
 
     def _forward(self, tensordict: TensorDictBase) -> TensorDictBase:
+        # Fix for "Mismatched Tensor types in NNPack convolutionOutput"
+        # NNPack conv gives error when input dtype differs from weights or when tensors split across devices
+        
+        # Pick dtype/device from model
+        param = next(self.parameters(), None)
+        target_dtype = param.dtype if param is not None else torch.float32
+        target_device = param.device if param is not None else None
+
+        # Align input to model dtype
+        def _match_model(tensor: torch.Tensor) -> torch.Tensor:
+            tensor = tensor.to(dtype=target_dtype)
+            if target_device is not None and tensor.device != target_device:
+                tensor = tensor.to(target_device)
+            return tensor
+        
         # Gather images
         input = torch.cat(
             [tensordict.get(in_key) for in_key in self.image_in_keys], dim=-1
-        ).to(torch.float)
+        )
+        input = _match_model(input)
         # BenchMARL images are X,Y,C -> we convert them to C, X, Y for processing in TorchRL models
         input = input.transpose(-3, -1).transpose(-2, -1)
 
@@ -269,6 +285,7 @@ class Cnn(Model):
             tensor_inputs = torch.cat(
                 [tensordict.get(in_key) for in_key in self.tensor_in_keys], dim=-1
             )
+            tensor_inputs = _match_model(tensor_inputs)
             if self.input_has_agent_dim and not self.output_has_agent_dim:
                 tensor_inputs = tensor_inputs.reshape((*tensor_inputs.shape[:-2], -1))
             elif not self.input_has_agent_dim and self.output_has_agent_dim:
