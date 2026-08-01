@@ -73,6 +73,7 @@ class ExperimentConfig:
     gamma: float = MISSING
     lr: float = MISSING
     adam_eps: float = MISSING
+    adam_extra_kwargs: Dict[str, Any] = MISSING
     clip_grad_norm: bool = MISSING
     clip_grad_val: Optional[float] = MISSING
 
@@ -120,6 +121,7 @@ class ExperimentConfig:
     checkpoint_interval: int = MISSING
     checkpoint_at_end: bool = MISSING
     keep_checkpoints_num: Optional[int] = MISSING
+    exclude_buffer_from_checkpoint: bool = MISSING
 
     def train_batch_size(self, on_policy: bool) -> int:
         """
@@ -524,7 +526,10 @@ class Experiment(CallbackNotifier):
         self.optimizers = {
             group: {
                 loss_name: torch.optim.Adam(
-                    params, lr=self.config.lr, eps=self.config.adam_eps
+                    params,
+                    lr=self.config.lr,
+                    eps=self.config.adam_eps,
+                    **self.config.adam_extra_kwargs,
                 )
                 for loss_name, params in self.algorithm.get_parameters(group).items()
             }
@@ -695,6 +700,7 @@ class Experiment(CallbackNotifier):
                             // self.rollout_env.batch_size.numel()
                         ),
                         policy=self.policy,
+                        auto_cast_to_device=True,
                         break_when_any_done=False,
                         auto_reset=False,
                         tensordict=reset_batch,
@@ -725,7 +731,9 @@ class Experiment(CallbackNotifier):
             # Loop over groups
             training_start = time.time()
             for group in self.train_group_map.keys():
-                group_batch = batch.exclude(*self._get_excluded_keys(group))
+                group_batch = batch.exclude(*self._get_excluded_keys(group)).to(
+                    self.config.train_device
+                )
                 group_batch = self.algorithm.process_batch(group, group_batch)
                 if not self.algorithm.has_rnn:
                     group_batch = group_batch.reshape(-1)
@@ -956,12 +964,15 @@ class Experiment(CallbackNotifier):
             state=state,
             **{f"loss_{k}": item.state_dict() for k, item in self.losses.items()},
             **{
-                f"buffer_{k}": item.state_dict() if len(item) else None
+                f"buffer_{k}": item.state_dict()
+                if len(item) and not self.config.exclude_buffer_from_checkpoint
+                else None
                 for k, item in self.replay_buffers.items()
             },
         )
         if not self.config.collect_with_grad:
             state_dict.update({"collector": self.collector.state_dict()})
+        self._on_state_dict(state_dict)
         return state_dict
 
     def load_state_dict(self, state_dict: Dict) -> None:
@@ -983,6 +994,7 @@ class Experiment(CallbackNotifier):
         self.total_frames = state_dict["state"]["total_frames"]
         self.n_iters_performed = state_dict["state"]["n_iters_performed"]
         self.mean_return = state_dict["state"]["mean_return"]
+        self._on_load_state_dict(state_dict)
 
     def _save_experiment(self) -> None:
         """Checkpoint trainer"""
@@ -1006,7 +1018,9 @@ class Experiment(CallbackNotifier):
         return self
 
     @staticmethod
-    def reload_from_file(restore_file: str) -> Experiment:
+    def reload_from_file(
+        restore_file: str, experiment_patch: Optional[Dict[str, Any]] = None
+    ) -> Experiment:
         """
         Restores the experiment from the checkpoint file.
 
@@ -1016,6 +1030,7 @@ class Experiment(CallbackNotifier):
 
         Args:
             restore_file (str): The checkpoint file (.pt) of the experiment reload.
+            experiment_patch (Optional[Dict[str, Any]]): The patch to apply to the experiment config.
 
         Returns:
             The reloaded experiment.
@@ -1036,6 +1051,11 @@ class Experiment(CallbackNotifier):
             callbacks = pickle.load(f)
         task.config = task_config
         experiment_config.restore_file = restore_file
+        if experiment_patch is not None:
+            for key, value in experiment_patch.items():
+                if not hasattr(experiment_config, key):
+                    raise ValueError(f"Experiment config does not have attribute {key}")
+                setattr(experiment_config, key, value)
         experiment = Experiment(
             task=task,
             algorithm_config=algorithm_config,
